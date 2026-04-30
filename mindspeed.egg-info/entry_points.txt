@@ -1,0 +1,2 @@
+[console_scripts]
+mindspeed = mindspeed.run.run:main
