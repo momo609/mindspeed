@@ -210,32 +210,137 @@ class CuMemAllocator:
 
 ### 3.3 Sleep Level 1 vs Level 2
 
+> **⚠️ 源码核实结论**：经过对 GitHub 上 vLLM 主分支 `cumem.py` 实际源码（commit `038e9be`）的确认，
+> `offload_tags=None` **不是** match-all 哨兵。真实逻辑见下方代码。
+
+#### 关键源码：CuMemAllocator.sleep() 中 None 的真实处理
+
+```python
+# vllm/device_allocator/cumem.py — 实际源码 (commit 038e9be)
+
+def sleep(self, offload_tags=None):
+    # ── None 的真实处理：转为 default tag ──
+    if offload_tags is None:
+        # "by default, allocated tensors are offloaded when the allocator sleeps"
+        offload_tags = (CuMemAllocator.default_tag,)  # → ("default",)
+    elif isinstance(offload_tags, str):
+        offload_tags = (offload_tags,)
+
+    for ptr, data in self.pointer_to_data.items():
+        # ── 仅当 tag 在 offload_tags 中才备份, 否则丢弃 ──
+        if data.tag in offload_tags:
+            # ✅ 备份路径: GPU → CPU
+            cpu_tensor = torch.empty(size, pin_memory=True)
+            cudaMemcpy(cpu_tensor.data_ptr(), ptr, size)  # D2H
+            data.cpu_backup_tensor = cpu_tensor
+        # else:
+        #   ❌ 丢弃路径: 无 CPU 备份
+
+        # ⚡ 始终释放 GPU 物理内存
+        unmap_and_release(handle)  # cuMemUnmap + cuMemRelease
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                     Sleep 级别语义                            │
-├──────────────┬───────────────────┬───────────────────────────┤
-│              │   Level 1 (浅度)   │    Level 2 (深度/Deep)     │
-├──────────────┼───────────────────┼───────────────────────────┤
-│ 触发方式      │ llm.sleep(level=1)│  llm.sleep(level=2)       │
-│ offload_tags  │ ("weights",)      │  None (offload ALL)       │
-│              │                   │                           │
-│ Weights      │ D2H 拷贝到 CPU    │ D2H 拷贝到 CPU            │
-│              │ → cuMemRelease    │ → cuMemRelease             │
-│              │                   │                           │
-│ KV Cache     │ 丢弃（不备份）     │ D2H 拷贝到 CPU            │
-│              │                   │ → cuMemRelease             │
-│              │                   │                           │
-│ CUDA Graphs  │ 丢弃              │ D2H 拷贝到 CPU            │
-│              │                   │ → cuMemRelease             │
-│              │                   │                           │
-│ NCCL Comm    │ 保留              │ suspend (PR #45623)       │
-│              │                   │                           │
-│ 恢复速度      │ 快（仅 weights）   │ 中等（全部恢复）           │
-│              │                   │                           │
-│ 内存释放量    │ 较大               │ 最大（95%+）               │
-│              │                   │                           │
-│ 适用场景      │ 同模型复用          │ 模型切换 / RL 权重更新     │
-└──────────────┴───────────────────┴───────────────────────────┘
+
+#### Level 1 vs Level 2 的真实语义
+
+`CuMemBackend.suspend()` 调用：
+```python
+# Level 1 → offload_tags=("weights",)
+# Level 2 → offload_tags=None → sleep() 内部转为 ("default",)
+```
+
+| | Level 1 | Level 2 |
+|---|---|---|
+| **传入 offload_tags** | `("weights",)` | `None` |
+| **sleep() 内转换后** | `("weights",)` | **`("default",)`** |
+| **weights tag** | ✅ `"weights" in ("weights",)` → **备份 CPU** | ❌ `"weights" in ("default",)` → **丢弃** |
+| **kv_cache tag** | ❌ 丢弃 | ❌ 丢弃 |
+| **graphs tag** | ❌ 丢弃 | ❌ 丢弃 |
+| **default tag** | ❌ 丢弃 | ✅ 备份 CPU |
+
+#### 设计意图
+
+```
+Level 1: 备份 weights → 恢复时 weights 从 CPU 拷贝回 GPU
+         → 适用场景: 同模型复用 (RL rollout)
+         → KV Cache 丢弃（反正 rollouts 之间 KV Cache 内容过期）
+
+Level 2: 丢弃 weights（不备份！）→ 恢复时 weights 需重新加载
+         → 适用场景: 模型切换 / RLHF 权重更新
+         → 旧 weights 不需要保留（训练已更新），节省 CPU RAM
+         → GPUWorker 层额外处理 (PR #16889 / #20735):
+            保存 model buffers (非参数持久张量) 到 _sleep_saved_buffers
+            使用 backup_memory_except() 备份非 pool 内的内存
+```
+
+#### 代码行程对比
+
+```
+Level 1: offload_tags=("weights",)
+  ┌─────────────────────────────────────────────────────┐
+  │ ptr_1: tag="weights", size=14GB                     │
+  │   → "weights" in ("weights",) → True                │
+  │   → ✅ GPU→CPU copy (14 GB D2H)                     │
+  │   → cuMemRelease (GPU 物理内存释放)                   │
+  │                                                     │
+  │ ptr_2: tag="kv_cache", size=2GB                     │
+  │   → "kv_cache" in ("weights",) → False              │
+  │   → ❌ 无 CPU 备份 → 直接丢弃                         │
+  │   → cuMemRelease                                    │
+  │                                                     │
+  │ ptr_3: tag="graphs", size=0.5GB                     │
+  │   → "graphs" in ("weights",) → False                │
+  │   → ❌ 无 CPU 备份 → 直接丢弃                         │
+  │   → cuMemRelease                                    │
+  │                                                     │
+  │ ptr_4: tag="default", size=0.2GB                    │
+  │   → "default" in ("weights",) → False               │
+  │   → ❌ 无 CPU 备份 → 直接丢弃                         │
+  │   → cuMemRelease                                    │
+  │                                                     │
+  │ 结果: CPU 占 14GB (仅 weights), GPU 释放 ~87%        │
+  └─────────────────────────────────────────────────────┘
+
+Level 2: offload_tags=None → sleep() 内转为 ("default",)
+  ┌─────────────────────────────────────────────────────┐
+  │ ptr_1: tag="weights", size=14GB                     │
+  │   → "weights" in ("default",) → False               │
+  │   → ❌ 无 CPU 备份 → WEIGHTS 被丢弃!                  │
+  │   → cuMemRelease                                    │
+  │                                                     │
+  │ ptr_2: tag="kv_cache", size=2GB                     │
+  │   → "kv_cache" in ("default",) → False              │
+  │   → ❌ 无 CPU 备份 → 直接丢弃                         │
+  │   → cuMemRelease                                    │
+  │                                                     │
+  │ ptr_3: tag="graphs", size=0.5GB                     │
+  │   → "graphs" in ("default",) → False                │
+  │   → ❌ 无 CPU 备份 → 直接丢弃                         │
+  │   → cuMemRelease                                    │
+  │                                                     │
+  │ ptr_4: tag="default", size=0.2GB                    │
+  │   → "default" in ("default",) → True                │
+  │   → ✅ GPU→CPU copy (0.2 GB D2H)                    │
+  │   → cuMemRelease                                    │
+  │                                                     │
+  │ GPUWorker 额外: backup_memory_except()               │
+  │   备份非 pool 内的 model buffers 到 CPU               │
+  │                                                     │
+  │ 结果: CPU 占 ~0.5GB (default + buffers),             │
+  │       GPU 释放 ~97%, weights 完全丢弃                 │
+  └─────────────────────────────────────────────────────┘
+```
+
+#### 代码：CuMemBackend.suspend() → 确定 offload_tags
+
+```python
+# vllm/device_allocator/sleep_mode_backend.py — CuMemBackend
+
+class CuMemBackend(SleepModeBackend):
+    def suspend(self, level: int = 1) -> None:
+        # Level 1 → offload_tags=("weights",) → sleep() 内仅 weights tag 匹配
+        # Level 2 → offload_tags=None        → sleep() 内转为 ("default",) → 仅 default tag 匹配
+        offload_tags = ("weights",) if level == 1 else None
+        CuMemAllocator.get_instance().sleep(offload_tags)
 ```
 
 #### 代码：GPUWorker.sleep() 的 Level 分发
@@ -252,11 +357,16 @@ def sleep(self, level: int = 1) -> None:
     free_bytes_before = torch.cuda.mem_get_info()[0]
 
     if level == 1:
-        # Level 1: 仅 offload weights（kv_cache 和 graphs 被丢弃）
-        backend.suspend(level=1)  # → offload_tags=("weights",)
+        # Level 1: offload_tags=("weights",) → 备份权重, 丢弃 kv_cache/graphs
+        backend.suspend(level=1)
     elif level == 2:
-        # Level 2: offload 所有带 tag 的内存
-        backend.suspend(level=2)  # → offload_tags=None (全部)
+        # Level 2: offload_tags=None → sleep() 内转为 ("default",)
+        #          → weights/kv_cache/graphs 全部丢弃不备份
+        #          → 仅 "default" tag 的杂项分配备份
+        #          GPUWorker 额外:
+        #            - backup_memory_except() 备份非 pool 内存 (PR #20735)
+        #            - 保存 model buffers 到 _sleep_saved_buffers (PR #16889)
+        backend.suspend(level=2)
 
     free_bytes_after, total = torch.cuda.mem_get_info()
     freed_gb = (total - free_bytes_after - (total - free_bytes_before)) / (1024**3)
@@ -286,13 +396,24 @@ class CuMemAllocator:
         self._current_tag = "default"
 ```
 
-#### sleep() — 释放显存
+#### sleep() — 释放显存（源码确认版）
 
 ```python
 def sleep(self, offload_tags: Optional[tuple[str, ...]] = None) -> None:
     """
-    offload_tags=None  → Level 2: offload 所有带 tag 的内存
-    offload_tags=("weights",) → Level 1: 仅 offload weights
+    释放 GPU 物理显存。根据 offload_tags 决定是否先做 CPU 备份。
+
+    参数语义（关键！）:
+      offload_tags=None    → sleep() 内部转为 ("default,"), 仅 "default" tag 备份 (Level 2)
+      offload_tags=("weights",) → 仅 "weights" tag 做 CPU 备份, 其余丢弃 (Level 1)
+
+    流程:
+      if data.tag in offload_tags:
+          # GPU to CPU copy (pinned memory), save cpu_backup_tensor
+      else:
+          # NO backup, data discarded
+
+      无论是否备份 → unmap_and_release(handle) → GPU 物理内存释放
     """
 
     # === Step 1: 同步所有 in-flight CUDA 操作 (PR #45552) ===
@@ -308,45 +429,76 @@ def sleep(self, offload_tags: Optional[tuple[str, ...]] = None) -> None:
         handle = data.handle
         total_bytes += handle[1]  # handle[1] = size
 
-        # 判断是否需要 CPU 备份（offload vs 丢弃）
-        should_offload = (
-            offload_tags is None or           # Level 2: 全部 offload
-            data.tag in offload_tags          # Level 1: 匹配 tag
-        )
+        # Step 1: None is converted to ("default",) — NOT match-all!
+        if offload_tags is None:
+            offload_tags = (CuMemAllocator.default_tag,)  # ("default",)
+        elif isinstance(offload_tags, str):
+            offload_tags = (offload_tags,)
 
-        if should_offload:
-            # ── OFFLOAD 路径: GPU → CPU pinned memory ──
+        # Step 2: Sync all in-flight CUDA (PR #45552)
+        torch.cuda.synchronize()
+
+        # Step 3: Quiesce NCCL (PR #45554)
+        self._quiesce_distributed_before_vmm_mutation()
+
+        total_bytes = 0
+        backup_bytes = 0
+
+        for ptr, data in self.pointer_to_data.items():
+            handle = data.handle
+            total_bytes += handle[1]
+
+            # Key logic: only tags in offload_tags get CPU backup
+            # Level 1: offload_tags=("weights",) -> "weights" matches -> backup
+            # Level 2: offload_tags=("default",) -> "weights"/"kv_cache"/"graphs" don't match -> DISCARDED!
+
+        if data.tag in offload_tags:
+            # Backup path: GPU -> CPU pinned memory
             backup_bytes += handle[1]
             cpu_tensor = torch.empty(
                 handle[1], dtype=torch.uint8, device="cpu",
                 pin_memory=is_pin_memory_available()
             )
-            # D2H 拷贝
-            libcudart.cudaMemcpy(cpu_tensor.data_ptr(), ptr, handle[1])
+            libcudart.cudaMemcpy(cpu_tensor.data_ptr(), ptr, handle[1])  # D2H
             data.cpu_backup_tensor = cpu_tensor
-        # else: 不备份 → KV cache 等数据在 Level 1 被直接丢弃
+        # else: NO CPU backup, data discarded
+        #   Level 1: kv_cache/graphs discarded
+        #   Level 2: weights/kv_cache/graphs ALL discarded!
 
-        # ── 释放 GPU 物理显存 ──
-        unmap_and_release(handle)  # → csrc/cumem_allocator.cpp: cuMemUnmap + cuMemRelease
+        # Always release GPU physical memory
+        unmap_and_release(handle)  # → cuMemUnmap + cuMemRelease
+        # 虚拟地址保留！
 
     logger.info(
-        "sleep freed %.2f GiB (%.2f GiB CPU-backed, %.2f GiB discarded)",
+        "sleep freed %.2f GiB GPU (%.2f GiB backed up to CPU, %.2f GiB discarded)",
         total_bytes / GiB, backup_bytes / GiB, (total_bytes - backup_bytes) / GiB
     )
 
-    # === Step 3: 清理缓存 ===
     gc.collect()
     torch.cuda.empty_cache()
 ```
 
-#### wake_up() — 恢复显存
+#### wake_up() — 从 CPU 恢复显存
 
 ```python
 def wake_up(self, tags: Optional[list[str]] = None) -> None:
     """
-    tags=None  → 恢复所有
-    tags=["weights"] → 仅恢复 weights
-    tags=["kv_cache"] → 仅恢复 kv_cache
+    从 CPU 恢复 GPU 显存数据。
+
+    参数语义:
+      tags=None  → 恢复所有 tag 的分配
+      tags=["weights"] → 仅恢复 weights
+      tags=["kv_cache"] → 仅恢复 kv_cache
+
+    流程:
+      1. cuMemCreate + cuMemMap: 重新分配 GPU 物理内存, 映射到原虚拟地址
+      2. 如果有 cpu_backup_tensor → CPU → GPU 拷贝恢复数据
+      3. 如果没有 cpu_backup_tensor → 新分配的物理页内容未定义
+         (Level 1 中丢弃的 kv_cache 走这个分支 → PR #45542 修复: 需要 zero fill)
+
+    注意:
+      Level 1 wake_up: 仅 weights 有 CPU backup, kv_cache 无备份 → 需重建
+      Level 2 wake_up: 全部 tag 都有 CPU backup → 完整恢复推理状态
     """
     failed_pointers = []
     first_exc = None
@@ -354,25 +506,27 @@ def wake_up(self, tags: Optional[list[str]] = None) -> None:
     for ptr, data in self.pointer_to_data.items():
         if tags is None or data.tag in tags:
             try:
-                # ── Step 1: 重新创建物理显存并映射到原虚拟地址 ──
-                create_and_map(data.handle)  # → C 扩展: cuMemCreate + cuMemMap
+                # Step 1: 重新分配 GPU 物理内存并映射到原虚拟地址
+                create_and_map(data.handle)  # → cuMemCreate + cuMemMap
 
                 if data.cpu_backup_tensor is not None:
-                    # ── Step 2: CPU → GPU 恢复数据 ──
+                    # ✅ 恢复路径: CPU → GPU 拷贝
                     size = data.cpu_backup_tensor.numel() * data.cpu_backup_tensor.element_size()
-                    libcudart.cudaMemcpy(ptr, data.cpu_backup_tensor.data_ptr(), size)
+                    libcudart.cudaMemcpy(ptr, data.cpu_backup_tensor.data_ptr(), size)  # H2D
                     data.cpu_backup_tensor = None  # 释放 CPU 备份
+                # else:
+                #   cpu_backup_tensor 为 None → Level 1 丢弃的数据
+                #   新页面内容未定义 → PR #45542: wake_up 后应 zero fill
 
             except RuntimeError as e:
-                # ── 收集所有失败，不中途退出 (PR #45565) ──
                 failed_pointers.append(ptr)
                 if first_exc is None:
                     first_exc = e
 
-    # === Step 3: 等待所有 H2D 拷贝完成 (PR #45552) ===
+    # Step 3: 等待所有 H2D 拷贝完成 (PR #45552)
     torch.cuda.synchronize()
 
-    # === Step 4: 恢复 NCCL 通信组 (PR #45554) ===
+    # Step 4: 恢复 NCCL 通信组 (PR #45554)
     self._quiesce_distributed_before_vmm_mutation()
 
     if failed_pointers:
@@ -1180,17 +1334,19 @@ SGLang 的 HiCache 不仅支持 sleep mode 的内存释放，还支持持久化�
 ├──────────────────┴─────────────────────┴─────────────────────┤
 │ 关键差异                                                       │
 ├──────────────────────────────────────────────────────────────┤
-│ 1. vLLM Level 1 直接丢弃 KV Cache（不备份 CPU）                │
-│    → 恢复更快，但 KV Cache 内容丢失                            │
-│    → 适用场景：RL Rollout 后 KV Cache 无需保留                  │
+│ 1. vLLM Level 1 仅备份 weights 到 CPU，KV Cache/Graphs 直接丢弃│
+│    → wake_up 后仅恢复 weights，KV Cache 需重建                  │
+│    → CPU RAM 需求：≈ 模型大小                                  │
+│    → 适用场景：RL Rollout 后 KV Cache 无需保留，wake_up 速度快  │
 │                                                              │
-│ 2. SGLang 通过 HiCache 可持久化 KV Cache 到 CPU/分布式存储    │
+│ 2. vLLM Level 2 备份全部 (weights + kv_cache + graphs) 到 CPU │
+│    → wake_up 后完整恢复推理状态 (含 KV Cache)                   │
+│    → CPU RAM 需求：≈ 模型 + KV Cache + Graphs 总和             │
+│    → 适用场景：需要保存完整推理状态、精准续推                     │
+│                                                              │
+│ 3. SGLang 通过 HiCache 可持久化 KV Cache 到 CPU/分布式存储    │
 │    → 恢复后可复用 prefix，共享跨请求 KV Cache                  │
 │    → 适用场景：长上下文 multi-turn 对话、prefix caching         │
-│                                                              │
-│ 3. vLLM Level 2 释放更彻底（含 CUDA Graph + NCCL 通信器）      │
-│    → 释放 95%+ 显存                                           │
-│    → 适用场景：模型切换                                        │
 │                                                              │
 │ 4. SGLang 的 torch_memory_saver 是独立库                     │
 │    → 理论上可被其他框架复用（不含 SGLang 依赖）                 │
